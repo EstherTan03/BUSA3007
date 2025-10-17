@@ -1,18 +1,26 @@
+// src/components/Header.jsx
 import React, { useEffect, useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import './Header.css';
 import WalletButton from './WalletButton';
 
-const API_BASE = 'http://localhost:5000';
+const API_BASE = process.env.REACT_APP_API_BASE || 'http://localhost:5000';
 
 const Header = () => {
   const [name, setUsername] = useState(null);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const navigate = useNavigate();
   const dropdownRef = useRef();
-  const [wallet, setWallet] = useState(null);
 
-  // ---- Modal & form state ----
+  const loggedIn = !!localStorage.getItem('token');
+
+  // wallet state comes from WalletButton via callbacks
+  const [wallet, setWallet] = useState(localStorage.getItem('wallet') || '');
+  const [walletVerified, setWalletVerified] = useState(
+    localStorage.getItem('wallet_verified') === 'true'
+  );
+
+  // ---- Create modal state ----
   const [showCreate, setShowCreate] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [msg, setMsg] = useState('');
@@ -27,26 +35,25 @@ const Header = () => {
     seller_address: '',
   });
 
-  // Derived flags for image fields
   const hasUrl = !!String(form.imageUrl || '').trim();
   const hasFile = !!form.imageFile;
 
-  // Fetch current user for header + prefill seller name
+  // Load current user (prefill seller name)
   useEffect(() => {
     const token = localStorage.getItem('token');
     if (!token) return;
 
-    const fetchUserName = async () => {
+    (async () => {
       try {
         const response = await fetch(`${API_BASE}/property/protected`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         const data = await response.json();
+
         if (response.ok && data.user?.name) {
           setUsername(data.user.name);
           localStorage.setItem('name', data.user.name);
-          // Prefill seller name in modal
-          setForm(f => ({ ...f, seller_name: data.user.name || '' }));
+          setForm((f) => ({ ...f, seller_name: data.user.name || '' }));
         } else {
           setUsername(null);
           localStorage.removeItem('token');
@@ -59,8 +66,7 @@ const Header = () => {
         localStorage.removeItem('name');
         navigate('/login');
       }
-    };
-    fetchUserName();
+    })();
   }, [navigate]);
 
   // Close profile dropdown on outside click
@@ -74,45 +80,51 @@ const Header = () => {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  // Keep modal address synced with connected wallet (read-only display)
+  // Keep modal’s seller_address synced with the connected wallet
   useEffect(() => {
-    setForm((f) => ({ ...f, seller_address: wallet || localStorage.getItem('wallet') || '' }));
+    setForm((f) => ({ ...f, seller_address: wallet || '' }));
   }, [wallet]);
 
   const handleLogout = () => {
     localStorage.removeItem('token');
     localStorage.removeItem('name');
     localStorage.removeItem('username');
+    localStorage.removeItem('wallet');
+    localStorage.removeItem('wallet_verified');
+    localStorage.removeItem('email');
+    localStorage.removeItem('role');
+
     setUsername(null);
+    setWallet('');
+    setWalletVerified(false);
     navigate('/login');
   };
 
-  // Open modal directly (no role toggle)
+  // Open create modal
   const openCreateModal = () => {
     setMsg('');
     const currentName = localStorage.getItem('name') || name || '';
     const currentWallet = wallet || localStorage.getItem('wallet') || '';
-    setForm(f => ({
+    setForm((f) => ({
       ...f,
       seller_name: currentName,
       seller_address: currentWallet,
-      // keep previously typed fields if any
     }));
     setShowCreate(true);
   };
 
   const onChange = (e) => setForm({ ...form, [e.target.name]: e.target.value });
 
-  // Image URL change: if user starts typing a URL, clear file and disable it
+  // Image URL change: if user types URL, clear file
   const onImageUrlChange = (e) => {
     const val = e.target.value;
-    setForm(f => ({ ...f, imageUrl: val, imageFile: val ? null : f.imageFile }));
+    setForm((f) => ({ ...f, imageUrl: val, imageFile: val ? null : f.imageFile }));
   };
 
-  // File change: if user picks a file, clear URL and disable it
+  // File change: if user picks a file, clear URL
   const onFileChange = (e) => {
     const file = e.target.files?.[0] || null;
-    setForm(f => ({ ...f, imageFile: file, imageUrl: file ? '' : f.imageUrl }));
+    setForm((f) => ({ ...f, imageFile: file, imageUrl: file ? '' : f.imageUrl }));
   };
 
   const createProperty = async (e) => {
@@ -121,7 +133,7 @@ const Header = () => {
     const token = localStorage.getItem('token');
     if (!token) return setMsg('Please login first.');
 
-    // All fields required (except imageUrl/imageFile: at least one)
+    // Basic validation
     if (!form.seller_name) return setMsg('Seller name is required.');
     if (!form.location) return setMsg('Location is required.');
     if (!String(form.num_of_rooms).trim() || !/^\d+$/.test(String(form.num_of_rooms))) {
@@ -133,13 +145,9 @@ const Header = () => {
     if (!String(form.price_in_ETH).trim() || !/^\d+(\.\d+)?$/.test(String(form.price_in_ETH))) {
       return setMsg('Price (ETH) is required and must be a number (e.g. 0.05).');
     }
-
-    // Image rule: either URL or file must be provided
     if (!hasUrl && !hasFile) {
       return setMsg('Please provide an Image URL or upload an image file.');
     }
-
-    // If URL provided, validate it
     if (hasUrl && !/^https?:\/\/.+/i.test(String(form.imageUrl))) {
       return setMsg('Image URL must start with http(s)://');
     }
@@ -159,16 +167,16 @@ const Header = () => {
           setSubmitting(false);
           return setMsg(upData.error || 'Image upload failed');
         }
-        // Make absolute URL so frontend can render it anywhere
         imageUrlToUse = `${API_BASE}${upData.url}`;
       }
 
-      // Create property
+      // 1) Create property (DB only)
       const res = await fetch(`${API_BASE}/property/create`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           seller_name: form.seller_name,
+          seller_address: wallet,
           num_of_rooms: Number(form.num_of_rooms),
           num_of_bedroom: Number(form.num_of_bedroom),
           location: form.location,
@@ -181,8 +189,42 @@ const Header = () => {
         setSubmitting(false);
         return setMsg(data.error || 'Create failed');
       }
+      const prop = data.property || data;
 
-      setMsg('✅ Property created!');
+      // 2) On-chain: deploy/attach + approve + list, then patch the property
+      try {
+        const oc = await fetch(`${API_BASE}/onchain/deploy-and-list`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            propertyId: prop._id,
+            seller_address: prop.seller_address,
+            price_in_ETH: prop.price_in_ETH,
+            tokenId: 1, // or omit to let the backend decide/mint
+          }),
+        });
+        const onchain = await oc.json();
+
+        if (oc.ok) {
+          // Patch property with on-chain fields if your /onchain route didn't already save them
+          await fetch(`${API_BASE}/property/${prop._id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              deed_address: onchain.deed_address,
+              escrow_address: onchain.escrow_address,
+              tokenId: onchain.tokenId,
+              dealId: onchain.dealId,
+            }),
+          });
+        } else {
+          console.warn('Onchain failed:', onchain.error);
+        }
+      } catch (err) {
+        console.warn('Onchain error:', err?.message || err);
+      }
+
+      setMsg('✅ Property created & listed on-chain!');
       setForm({
         seller_name: localStorage.getItem('name') || name || '',
         num_of_rooms: '',
@@ -193,7 +235,10 @@ const Header = () => {
         imageFile: null,
         seller_address: wallet || localStorage.getItem('wallet') || '',
       });
-      setTimeout(() => { setShowCreate(false); setMsg(''); }, 900);
+      setTimeout(() => {
+        setShowCreate(false);
+        setMsg('');
+      }, 900);
     } catch {
       setMsg('Network error');
     } finally {
@@ -206,17 +251,36 @@ const Header = () => {
       <h2 className="brand">Project Name</h2>
 
       <div className="header-right">
-        {/* Open modal */}
+        {loggedIn && (
+          <WalletButton
+            onAddress={(a) => {
+              setWallet(a);
+              localStorage.setItem('wallet', a || '');
+            }}
+            onVerified={(v) => {
+              setWalletVerified(!!v);
+              localStorage.setItem('wallet_verified', String(!!v));
+            }}
+          />
+        )}
+
         <button
           type="button"
           className="role-btn"
           onClick={openCreateModal}
-          title="Create a new property"
+          disabled={!loggedIn || !wallet || !walletVerified}
+          title={
+            !loggedIn
+              ? 'Login first'
+              : !wallet
+              ? 'Connect wallet first'
+              : !walletVerified
+              ? 'Verify wallet first'
+              : 'Create a property'
+          }
         >
           Sell Property
         </button>
-
-        <WalletButton onAddress={(addr) => setWallet(addr)} />
 
         <div className="profile-section" ref={dropdownRef}>
           <img
@@ -228,9 +292,7 @@ const Header = () => {
           />
           {dropdownOpen && (
             <div className="dropdown-menu">
-              <div className="dropdown-greeting">
-                {name ? `Hi, ${name}` : 'Account'}
-              </div>
+              <div className="dropdown-greeting">{name ? `Hi, ${name}` : 'Account'}</div>
               <button onClick={handleLogout}>Logout</button>
             </div>
           )}
@@ -252,6 +314,7 @@ const Header = () => {
                 style={{ ...styles.input, background: '#f3f4f6', color: '#374151' }}
                 title="Taken from your account name"
               />
+
               <div style={styles.row}>
                 <input
                   name="num_of_rooms"
@@ -272,6 +335,7 @@ const Header = () => {
                   inputMode="numeric"
                 />
               </div>
+
               <input
                 name="location"
                 placeholder="Location"
@@ -280,6 +344,7 @@ const Header = () => {
                 required
                 style={styles.input}
               />
+
               <input
                 name="price_in_ETH"
                 placeholder="Price (ETH)"
@@ -309,7 +374,6 @@ const Header = () => {
                 title={hasUrl ? 'Disabled because an image URL is provided' : 'Upload an image file'}
               />
 
-              {/* Optional preview if a file is selected */}
               {form.imageFile && (
                 <img
                   alt="Preview"
@@ -338,7 +402,12 @@ const Header = () => {
                 <button type="submit" disabled={submitting} style={styles.primary}>
                   {submitting ? 'Creating…' : 'Create'}
                 </button>
-                <button type="button" disabled={submitting} onClick={() => setShowCreate(false)} style={styles.ghost}>
+                <button
+                  type="button"
+                  disabled={submitting}
+                  onClick={() => setShowCreate(false)}
+                  style={styles.ghost}
+                >
                   Cancel
                 </button>
               </div>
@@ -351,13 +420,40 @@ const Header = () => {
 };
 
 const styles = {
-  backdrop: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,.35)', display: 'grid', placeItems: 'center', zIndex: 50 },
-  modal: { width: 420, background: '#fff', borderRadius: 12, padding: 16, boxShadow: '0 10px 30px rgba(0,0,0,.25)' },
+  backdrop: {
+    position: 'fixed',
+    inset: 0,
+    background: 'rgba(0,0,0,.35)',
+    display: 'grid',
+    placeItems: 'center',
+    zIndex: 50,
+  },
+  modal: {
+    width: 420,
+    background: '#fff',
+    borderRadius: 12,
+    padding: 16,
+    boxShadow: '0 10px 30px rgba(0,0,0,.25)',
+  },
   form: { display: 'flex', flexDirection: 'column', gap: 10 },
   row: { display: 'flex', gap: 10 },
   input: { padding: 10, fontSize: 14, borderRadius: 8, border: '1px solid #e5e7eb' },
-  primary: { padding: '10px 12px', borderRadius: 8, background: '#111827', color: '#fff', border: '1px solid #111827', cursor: 'pointer' },
-  ghost: { padding: '10px 12px', borderRadius: 8, background: '#fff', color: '#111827', border: '1px solid #e5e7eb', cursor: 'pointer' },
+  primary: {
+    padding: '10px 12px',
+    borderRadius: 8,
+    background: '#111827',
+    color: '#fff',
+    border: '1px solid #111827',
+    cursor: 'pointer',
+  },
+  ghost: {
+    padding: '10px 12px',
+    borderRadius: 8,
+    background: '#fff',
+    color: '#111827',
+    border: '1px solid #e5e7eb',
+    cursor: 'pointer',
+  },
 };
 
 export default Header;

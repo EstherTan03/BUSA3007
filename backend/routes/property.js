@@ -43,6 +43,18 @@ router.post('/create', authenticateUser, async (req, res) => {
     if (price_in_ETH <= 0) {
       return res.status(422).json({ error: 'price_in_ETH must be > 0' });
     }
+    if (!req.user.wallet_address) {
+      return res.status(400).json({ error: 'Connect wallet first (wallet_address missing on profile)' });
+    }
+    try {
+      // normalize & validate 0x…
+      req.user.wallet_address = ethers.getAddress(req.user.wallet_address);
+    } catch {
+      return res.status(400).json({ error: 'Invalid wallet address on profile' });
+    }
+    if (!req.user.wallet_verified) {
+      return res.status(403).json({ error: 'Verify wallet signature first' });
+    }
 
     // Create — IMPORTANT: match your schema’s field name exactly.
     const created = await Property.create({

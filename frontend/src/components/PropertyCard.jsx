@@ -1,36 +1,61 @@
-// components/PropertyCard.jsx
+// src/components/PropertyCard.jsx
 import React, { useMemo, useState } from 'react';
 import './PropertyCard.css';
 import { ethers } from 'ethers';
+import {
+  getDeedContract,
+  getEscrowContract,
+  assertContractCode,
+  fnList,
+  DEFAULT_DEED_ADDRESS,
+  DEFAULT_ESCROW_ADDRESS,
+} from '../web3';
 
-const API = 'http://localhost:5000';
+const API = process.env.REACT_APP_API_BASE || 'http://localhost:5000';
 
 function PropertyCard({ property = {}, currentWallet: walletFromProp }) {
   const {
     _id,
-    imageUrl = '',                 // normalized by HomePage to DB value
+    imageURL,
+    imageUrl,
     location = 'Unknown',
     seller_name = 'N/A',
     seller_address = '',
     num_of_rooms = 0,
     num_of_bedroom = 0,
-    price_in_ETH: initialPrice = 0,
+    price_in_ETH = 0,
+
+    // prefer per-listing values if present
+    deed_address: deedAddrFromDb,
+    escrow_address: escrowAddrFromDb,
+    tokenId: tokenIdFromDb,
+    dealId: dealIdFromDb,
   } = property;
 
-  // Local UI state so we can update immediately after edits
-  const [displayUrl, setDisplayUrl] = useState(imageUrl);
-  const [price, setPrice] = useState(initialPrice);
+  // resolve addresses & ids with fallbacks
+  const deedAddr = deedAddrFromDb || DEFAULT_DEED_ADDRESS;
+  const escrowAddr = escrowAddrFromDb || DEFAULT_ESCROW_ADDRESS;
+  const tokenId = tokenIdFromDb ?? 1;
+
+  // local UI state
+  const [displayUrl, setDisplayUrl] = useState(imageURL || imageUrl || '');
+  const [price, setPrice] = useState(price_in_ETH);
   const [imgError, setImgError] = useState(false);
 
-  // Edit modal
+  // edit modal
   const [showEdit, setShowEdit] = useState(false);
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState('');
-  const [formUrl, setFormUrl] = useState('');   // paste image URL
-  const [file, setFile] = useState(null);       // or upload file
-  const [formPrice, setFormPrice] = useState(String(initialPrice || ''));
+  const [formUrl, setFormUrl] = useState('');
+  const [file, setFile] = useState(null);
+  const [formPrice, setFormPrice] = useState(String(price ?? ''));
 
-  // Wallet / role
+  // escrow state
+  const [dealId, setDealId] = useState(dealIdFromDb ?? null);
+  const [txMsg, setTxMsg] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  // who’s viewing? (seller vs buyer)
   const currentWallet = walletFromProp || localStorage.getItem('wallet') || '';
   const isSellerViewing = useMemo(() => {
     if (!currentWallet || !seller_address) return false;
@@ -38,78 +63,99 @@ function PropertyCard({ property = {}, currentWallet: walletFromProp }) {
     catch { return false; }
   }, [currentWallet, seller_address]);
 
-  // --------- Book / Pay (unchanged) ----------
-  const handlePay = async () => {
+  // ---------- SELLER: approve + list ----------
+  const approveAndList = async () => {
     try {
-      if (!window.ethereum) throw new Error('MetaMask not found');
-      if (!seller_address) throw new Error('Seller wallet not available');
-      if (!/^0x[a-fA-F0-9]{40}$/.test(seller_address)) throw new Error('Invalid seller address format');
+      if (!isSellerViewing) { setTxMsg('⚠️ Only seller can list'); return; }
+      if (!deedAddr || !escrowAddr) { setTxMsg('⚠️ Missing contract addresses'); return; }
 
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      const signer = await provider.getSigner();
+      setBusy(true);
+      setTxMsg('⏳ Checking contracts…');
 
-      // Linea mainnet 59144
-      const net = await provider.getNetwork();
-      if (Number(net.chainId) !== 59144) {
-        await window.ethereum.request({
-          method: 'wallet_switchEthereumChain',
-          params: [{ chainId: '0xE708' }],
+      // guard wrong network / bad address
+      await assertContractCode(deedAddr);
+      await assertContractCode(escrowAddr);
+
+      const deed = await getDeedContract(deedAddr);
+
+      // approve escrow for this token if needed
+      const approved = await deed.getApproved(ethers.toBigInt(tokenId));
+      if (!approved || approved.toLowerCase() !== escrowAddr.toLowerCase()) {
+        setTxMsg('⏳ Approving escrow to transfer your token…');
+        const tx1 = await deed.approve(escrowAddr, ethers.toBigInt(tokenId));
+        await tx1.wait();
+      }
+
+      // list on escrow
+      const escrow = await getEscrowContract(escrowAddr);
+      const listName = fnList(escrow); // throws if ABI mismatch
+
+      setTxMsg('⏳ Listing on escrow…');
+      const priceWei = ethers.parseEther(String(price_in_ETH ?? '0'));
+      const tx2 = await escrow[listName](deedAddr, tokenId, priceWei);
+      const rcpt = await tx2.wait();
+
+      // try to extract a dealId from any event containing "deal"
+      let newId = null;
+      try {
+        const log = rcpt.logs?.find(l => (l.fragment?.name || '').toLowerCase().includes('deal'));
+        newId = log?.args?.dealId ? Number(log.args.dealId) : null;
+      } catch {}
+
+      // persist so buyers don’t see “must list” after refresh
+      if (newId != null) {
+        setDealId(newId);
+        await fetch(`${API}/property/${_id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dealId: newId, escrow_address: escrowAddr, deed_address: deedAddr })
         });
+        setTxMsg(`✅ Listed (Deal ID: ${newId}). Buyer can press Buy.`);
+      } else {
+        setTxMsg('✅ Listed. (Could not parse dealId from events — consider adding a getter to your contract.)');
       }
-
-      const fromAddr = await signer.getAddress();
-
-      // Recipient must be EOA (not contract)
-      const code = await provider.getCode(seller_address);
-      if (code && code !== '0x') throw new Error('Recipient is a contract and may not accept direct ETH transfers');
-
-      const valueEth = String(price ?? 0).trim();
-      if (!/^\d+(\.\d+)?$/.test(valueEth)) throw new Error('Invalid price format');
-      const valueWei = ethers.parseEther(valueEth);
-      if (valueWei <= 0n) throw new Error('Amount must be > 0');
-
-      // simple balance + gas check
-      const [balance, gasPrice] = await Promise.all([
-        provider.getBalance(fromAddr),
-        provider.getGasPrice(),
-      ]);
-      const gasLimit = 21000n;
-      const needed = valueWei + gasPrice * gasLimit;
-      if (balance < needed) {
-        const short = Number(ethers.formatEther(needed - balance)).toFixed(6);
-        throw new Error(`Insufficient funds. Need ~${short} more ETH for value + gas`);
-      }
-
-      const tx = await signer.sendTransaction({ to: seller_address, value: valueWei, gasLimit });
-      await tx.wait(1);
-
-      // backend verification
-      const res = await fetch(`${API}/web3/verify`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ txHash: tx.hash, propertyId: _id, from: fromAddr }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Backend verification failed');
-
-      alert('Payment verified ✅');
     } catch (e) {
-      console.error('Pay error:', e);
-      const msg = e?.shortMessage || e?.info?.error?.message || e?.data?.message || e?.message || 'Payment failed';
-      alert(msg);
+      console.error(e);
+      setTxMsg(`❌ ${e.shortMessage || e.message}`);
+    } finally {
+      setBusy(false);
     }
   };
 
-  // --------- Edit (image + price) ----------
+  // ---------- BUYER: one-click Buy ----------
+  const buyNow = async () => {
+    try {
+      if (dealId == null) { setTxMsg('⚠️ Seller must list on escrow first'); return; }
+
+      setBusy(true);
+      setTxMsg('⏳ Preparing…');
+
+      await assertContractCode(escrowAddr); // guard wrong network / bad address
+      const escrow = await getEscrowContract(escrowAddr);
+
+      const valueWei = ethers.parseEther(String(price_in_ETH ?? '0'));
+      // adjust if your function is named depositEarnest instead
+      const tx = await escrow.deposit(dealId, { value: valueWei });
+      await tx.wait();
+
+      setTxMsg('✅ Payment deposited to escrow.');
+    } catch (e) {
+      console.error(e);
+      setTxMsg(`❌ ${e.shortMessage || e.message || 'Buy failed'}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // ---------- Edit (image + price) ----------
   const openEdit = () => {
     setMsg('');
     setFormUrl('');
     setFile(null);
-    setFormPrice(String(price || ''));
+    setFormPrice(String(price ?? ''));
     setShowEdit(true);
   };
 
-  // mutually exclusive image inputs
   const onUrlChange = (e) => {
     setFormUrl(e.target.value);
     if (e.target.value) setFile(null);
@@ -148,7 +194,6 @@ function PropertyCard({ property = {}, currentWallet: walletFromProp }) {
     if (finalUrl && !/^https?:\/\/.+/i.test(finalUrl)) {
       return setMsg('Image URL must start with http(s)://');
     }
-
     if (!finalUrl && pricePayload === undefined) {
       return setMsg('Nothing to update');
     }
@@ -157,7 +202,7 @@ function PropertyCard({ property = {}, currentWallet: walletFromProp }) {
       setSaving(true);
       const body = {};
       if (pricePayload !== undefined) body.price_in_ETH = pricePayload;
-      if (finalUrl) body.imageUrl = finalUrl; // backend accepts imageUrl/imageURL and writes to schema
+      if (finalUrl) body.imageUrl = finalUrl;
 
       const res = await fetch(`${API}/property/${_id}`, {
         method: 'PUT',
@@ -165,12 +210,8 @@ function PropertyCard({ property = {}, currentWallet: walletFromProp }) {
         body: JSON.stringify(body),
       });
       const data = await res.json();
-      if (!res.ok) {
-        setSaving(false);
-        return setMsg(data.error || 'Update failed');
-      }
+      if (!res.ok) { setSaving(false); return setMsg(data.error || 'Update failed'); }
 
-      // update local UI
       if (pricePayload !== undefined) setPrice(pricePayload);
       if (finalUrl) { setDisplayUrl(finalUrl); setImgError(false); }
 
@@ -183,53 +224,64 @@ function PropertyCard({ property = {}, currentWallet: walletFromProp }) {
     }
   };
 
+  // ---------- UI ----------
+  const imgSrc = displayUrl;
+  const priceStr = String(price ?? '0');
+
+  const buyerButtons = (
+    <div style={{ display: 'grid', gap: 8, marginTop: 8 }}>
+      <button
+        onClick={buyNow}
+        disabled={busy}
+        style={{ height: 40, borderRadius: 10, border: '1px solid rgba(0,0,0,.12)', background: '#111827', color: '#fff' }}
+      >
+        {busy ? 'Processing…' : `Buy for ${priceStr} ETH`}
+      </button>
+      {dealId == null && (
+        <div style={{ fontSize: 12, color: '#6b7280' }}>
+          Seller must list on escrow first.
+        </div>
+      )}
+    </div>
+  );
+
+  const sellerButtons = (
+    <div style={{ display: 'grid', gap: 8, marginTop: 8 }}>
+      <button
+        type="button"
+        onClick={openEdit}
+        disabled={busy}
+        style={{ height: 40, borderRadius: 10, border: '1px solid rgba(0,0,0,.12)', background: '#fff', color: '#111827' }}
+      >
+        Edit
+      </button>
+      <button
+        type="button"
+        onClick={approveAndList}
+        disabled={busy || dealId != null}
+        title={dealId != null ? 'Already listed' : ''}
+        style={{
+          height: 40, borderRadius: 10, border: '1px solid rgba(0,0,0,.12)',
+          background: dealId != null ? '#9ca3af' : '#111827', color: '#fff'
+        }}
+      >
+        {busy ? 'Processing…' : (dealId == null ? 'List on Escrow' : 'Listed')}
+      </button>
+    </div>
+  );
+
   return (
     <article className="prop-card">
       <div className="prop-card__image">
-        {displayUrl && !imgError ? (
-          <img
-            src={displayUrl}
-            alt={location || 'Property'}
-            loading="lazy"
-            onError={() => setImgError(true)}
-          />
+        {imgSrc && !imgError ? (
+          <img src={imgSrc} alt={location || 'Property'} loading="lazy" onError={() => setImgError(true)} />
         ) : (
-          <div
-            style={{
-              width: '100%',
-              height: 220,
-              borderTopLeftRadius: 16,
-              borderTopRightRadius: 16,
-              background: '#f3f4f6',
-              display: 'grid',
-              placeItems: 'center',
-              color: '#94a3b8',
-              fontSize: 14
-            }}
-          >
+          <div style={{
+            width: '100%', height: 220, borderTopLeftRadius: 16, borderTopRightRadius: 16,
+            background: '#f3f4f6', display: 'grid', placeItems: 'center', color: '#94a3b8', fontSize: 14
+          }}>
             No image
           </div>
-        )}
-
-        {/* Seller-only edit button */}
-        {isSellerViewing && (
-          <button
-            type="button"
-            onClick={openEdit}
-            style={{
-              position: 'absolute',
-              right: 12,
-              top: 12,
-              padding: '6px 10px',
-              borderRadius: 8,
-              border: '1px solid rgba(0,0,0,.12)',
-              background: '#ffffffdd',
-              cursor: 'pointer',
-              fontSize: 12
-            }}
-          >
-            Edit
-          </button>
         )}
       </div>
 
@@ -239,42 +291,29 @@ function PropertyCard({ property = {}, currentWallet: walletFromProp }) {
           <div className="prop-card__row"><dt>Seller</dt><dd>{seller_name}</dd></div>
           <div className="prop-card__row"><dt>Rooms</dt><dd>{num_of_rooms}</dd></div>
           <div className="prop-card__row"><dt>Bedrooms</dt><dd>{num_of_bedroom}</dd></div>
-          <div className="prop-card__row"><dt>Price (ETH)</dt><dd>{price}</dd></div>
+          <div className="prop-card__row"><dt>Price (ETH)</dt><dd>{priceStr}</dd></div>
+          {dealId != null && <div className="prop-card__row"><dt>Deal ID</dt><dd>{dealId}</dd></div>}
+          <div className="prop-card__row"><dt>Token ID</dt><dd>{tokenId}</dd></div>
         </dl>
 
-        <button
-          onClick={handlePay}
-          disabled={!seller_address || isSellerViewing}
-          style={{
-            marginTop: 8,
-            width: '100%',
-            height: 40,
-            borderRadius: 10,
-            border: '1px solid rgba(0,0,0,.12)',
-            background: isSellerViewing || !seller_address ? '#9ca3af' : '#111827',
-            color: '#fff',
-            cursor: isSellerViewing || !seller_address ? 'not-allowed' : 'pointer'
-          }}
-        >
-          {isSellerViewing ? 'You are the Seller' : 'Book / Pay'}
-        </button>
+        {isSellerViewing ? sellerButtons : buyerButtons}
+
+        {txMsg && (
+          <p style={{ marginTop: 8, fontSize: 13, color: txMsg.startsWith('✅') ? 'green' : '#2563eb' }}>
+            {txMsg}
+          </p>
+        )}
       </div>
 
       {/* Edit Modal */}
       {showEdit && (
         <div
           onClick={() => !saving && setShowEdit(false)}
-          style={{
-            position: 'fixed', inset: 0, background: 'rgba(0,0,0,.35)',
-            display: 'grid', placeItems: 'center', zIndex: 100
-          }}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.35)', display: 'grid', placeItems: 'center', zIndex: 100 }}
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            style={{
-              width: 420, background: '#fff', borderRadius: 12, padding: 16,
-              boxShadow: '0 10px 30px rgba(0,0,0,.25)'
-            }}
+            style={{ width: 420, background: '#fff', borderRadius: 12, padding: 16, boxShadow: '0 10px 30px rgba(0,0,0,.25)' }}
           >
             <h4 style={{ marginBottom: 12 }}>Edit Property</h4>
             <form onSubmit={saveChanges} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>

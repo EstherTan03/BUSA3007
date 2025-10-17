@@ -10,6 +10,8 @@ const userSchema = new mongoose.Schema({
     trim: true,
     match: [/^0x[a-fA-F0-9]{40}$/, 'Wallet must be 0x + 40 hex'],
   },
+  wallet_verified: { type: Boolean, default: false },// after signature check
+  wallet_nonce: { type: String, default: '' },       // random string for SIWE-like verification
 }, { timestamps: true });
 
 module.exports = mongoose.model('User', userSchema);
