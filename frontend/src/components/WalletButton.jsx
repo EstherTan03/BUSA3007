@@ -3,17 +3,22 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { ethers } from 'ethers';
 
 const API = process.env.REACT_APP_API || 'http://localhost:5000';
+const TARGET_CHAIN_ID = (process.env.REACT_APP_CHAIN_ID || '').toLowerCase(); 
 
-function WalletButton({ onAddress, onVerified }) {
+function WalletButton({ onAddress, onVerified, onProvider, onSigner }) {
   const [addr, setAddr] = useState(localStorage.getItem('wallet') || '');
   const [verified, setVerified] = useState(localStorage.getItem('wallet_verified') === 'true');
   const [busy, setBusy] = useState(false);
+  const [provider, setProvider] = useState(null);
+  const [signer, setSigner] = useState(null);
 
-  // ---- helpers --------------------------------------------------------------
+  // ---- notify parent --------------------------------------------------------
   const notifyParent = useCallback(() => {
     onAddress?.(addr || '');
     onVerified?.(verified || false);
-  }, [addr, verified, onAddress, onVerified]);
+    onProvider?.(provider || null);
+    onSigner?.(signer || null);
+  }, [addr, verified, provider, signer, onAddress, onVerified, onProvider, onSigner]);
 
   useEffect(() => { notifyParent(); }, [notifyParent]);
 
@@ -21,20 +26,28 @@ function WalletButton({ onAddress, onVerified }) {
   useEffect(() => {
     if (!window.ethereum) return;
 
-    const onAccountsChanged = (accounts) => {
+    const onAccountsChanged = async (accounts) => {
       const a = accounts?.[0] ? ethers.getAddress(accounts[0]) : '';
       setAddr(a);
       if (a) {
         localStorage.setItem('wallet', a);
+        try {
+          const p = new ethers.BrowserProvider(window.ethereum);
+          const s = await p.getSigner();
+          setProvider(p);
+          setSigner(s);
+        } catch {}
       } else {
         localStorage.removeItem('wallet');
         localStorage.removeItem('wallet_verified');
         setVerified(false);
+        setProvider(null);
+        setSigner(null);
       }
     };
 
     const onChainChanged = () => {
-      // simple: just refresh app so providers/signers reset
+      // simplest: reload so providers/signers reset
       window.location.reload();
     };
 
@@ -46,27 +59,41 @@ function WalletButton({ onAddress, onVerified }) {
     };
   }, []);
 
-  const doVerify = useCallback(async (provider, address) => {
+  // ---- chain guard (optional) ----------------------------------------------
+  const ensureTargetChain = async () => {
+    if (!TARGET_CHAIN_ID || !window.ethereum) return;
+    const current = (await window.ethereum.request({ method: 'eth_chainId' }))?.toLowerCase();
+    if (current === TARGET_CHAIN_ID) return;
+    try {
+      await window.ethereum.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: TARGET_CHAIN_ID }],
+      });
+    } catch (e) {
+      // If the chain isn't added to MetaMask, user must add it manually (or you can implement addChain here).
+      throw new Error('Wrong network. Please switch to the target chain in MetaMask.');
+    }
+  };
+
+  // ---- backend wallet verification -----------------------------------------
+  const doVerify = useCallback(async (prov, address) => {
     const token = localStorage.getItem('token');
     if (!token) return; // skip verify if not logged in
 
-    // 1) Save public wallet
     await fetch(`${API}/user/wallet`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ wallet_address: address }),
     });
 
-    // 2) Get nonce
     const nr = await fetch(`${API}/user/wallet/nonce`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     const { nonce } = await nr.json();
 
-    // 3) Sign + verify
-    const signer = await provider.getSigner();
+    const signer_ = await prov.getSigner();
     const message = `Sign to verify wallet with your account. Nonce: ${nonce}`;
-    const signature = await signer.signMessage(message);
+    const signature = await signer_.signMessage(message);
 
     const vr = await fetch(`${API}/user/wallet/verify`, {
       method: 'POST',
@@ -88,7 +115,10 @@ function WalletButton({ onAddress, onVerified }) {
     try {
       if (!window.ethereum) return alert('Install MetaMask');
       setBusy(true);
-      const provider = new ethers.BrowserProvider(window.ethereum);
+
+      await ensureTargetChain();
+
+      const prov = new ethers.BrowserProvider(window.ethereum);
 
       // If already connected, request permissions to trigger the account picker
       if (addr) {
@@ -97,24 +127,24 @@ function WalletButton({ onAddress, onVerified }) {
             method: 'wallet_requestPermissions',
             params: [{ eth_accounts: {} }],
           });
-        } catch {
-          // fallback for older MetaMask
-        }
+        } catch { /* older MetaMask fallback */ }
       }
 
-      // Request accounts (opens MetaMask if needed)
-      const accounts = await provider.send('eth_requestAccounts', []);
+      const accounts = await prov.send('eth_requestAccounts', []);
       const a = accounts && accounts[0] ? ethers.getAddress(accounts[0]) : '';
       if (!a) throw new Error('No account selected');
 
+      const s = await prov.getSigner();
+
       setAddr(a);
+      setProvider(prov);
+      setSigner(s);
       localStorage.setItem('wallet', a);
 
       // Optional: (re)verify on every (re)connect
       try {
-        await doVerify(provider, a);
+        await doVerify(prov, a);
       } catch (e) {
-        // don’t hard fail the connect flow if verification fails
         console.warn('verify failed:', e?.message || e);
       }
     } catch (e) {
@@ -139,8 +169,7 @@ function WalletButton({ onAddress, onVerified }) {
       >
         {busy ? 'Working…' : label}
       </button>
-
     </div>
   );
 }
-export default WalletButton
+export default WalletButton;

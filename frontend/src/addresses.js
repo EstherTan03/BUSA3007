@@ -1,4 +1,0 @@
-// src/addresses.js
-export const DEFAULT_DEED   = "0x1dF6AF5dd766f3E40C3F5515d44D0B192cD70255";
-export const DEFAULT_ESCROW = "0x681Ff9051a4Bf613111E3B3CCC829F568fE09C39";
-export const CHAIN_ID = 1337; 

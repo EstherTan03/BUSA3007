@@ -41,7 +41,7 @@ solidity: {
     localganache: {
       type: "http",
       url: 'http://127.0.0.1:7545' ,
-      accounts: ['0xbd9854733b71cb2c84272c75d432ccc4a41ca318d4360232d44918cce5a0c3f5'],
+      accounts: ['0x9fd6cfb16d2336dc24109c4382646e099b9be90ceed09b509c3c01993ce164a4'],
       chainId: 1337, 
     },
   },
